@@ -196,34 +196,34 @@ function splitText(text, maxLength) {
 
 async function getConversationId(env, userId) {
 	// 如果没有绑定 KV，则不保存多轮会话
-	if (!env.CONVERSATIONS) {
+	if (!env.DIFY_CONVERSATIONS) {
 		return '';
 	}
 
 	const key = `dify:conversation:${userId}`;
-	return await env.CONVERSATIONS.get(key);
+	return await env.DIFY_CONVERSATIONS.get(key);
 }
 
 async function saveConversationId(env, userId, conversationId) {
-	if (!env.CONVERSATIONS) {
+	if (!env.DIFY_CONVERSATIONS) {
 		return;
 	}
 
 	const key = `dify:conversation:${userId}`;
 
 	// 7 天过期，可按需调整
-	await env.CONVERSATIONS.put(key, conversationId, {
+	await env.DIFY_CONVERSATIONS.put(key, conversationId, {
 		expirationTtl: 60 * 60 * 24 * 7,
 	});
 }
 
 async function deleteConversationId(env, userId) {
-	if (!env.CONVERSATIONS) {
+	if (!env.DIFY_CONVERSATIONS) {
 		return;
 	}
 
 	const key = `dify:conversation:${userId}`;
-	await env.CONVERSATIONS.delete(key);
+	await env.DIFY_CONVERSATIONS.delete(key);
 }
 
 function jsonResponse(data, status = 200) {
