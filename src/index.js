@@ -19,6 +19,11 @@ export default {
 					ok: true,
 					service: 'dify-telegram-worker',
 					path: url.pathname,
+					hasTelegramToken: Boolean(env.TELEGRAM_BOT_TOKEN),
+					hasDifyApiKey: Boolean(env.DIFY_API_KEY),
+					hasDifyApiUrl: Boolean(env.DIFY_API_URL),
+					hasKV: Boolean(env.DIFY_CONVERSATIONS),
+					hasQueue: Boolean(env.TELEGRAM_QUEUE),
 				});
 			}
 
@@ -29,56 +34,39 @@ export default {
 
 			const update = await request.json();
 
-			// 处理 Telegram 消息
-			ctx.waitUntil(handleTelegramUpdate(update, env));
+			const message = update.message || update.edited_message;
 
-			// 立即返回 Telegram，避免超时
-			return jsonResponse({ ok: true });
-		} catch (error) {
-			return jsonResponse(
-				{
-					ok: false,
-					error: String(error),
-				},
-				500,
-			);
-		}
-	},
-};
+			if (!message || !message.text) {
+				return jsonResponse({ ok: true, skipped: true });
+			}
 
-async function handleTelegramUpdate(update, env) {
-	const message = update.message || update.edited_message;
+			const chatId = message.chat?.id;
+			const userId = String(message.from?.id || chatId || 'unknown');
+			const text = message.text;
+			const updateId = update.update_id;
 
-	if (!message) {
-		return;
-	}
+			if (!chatId || !text) {
+				return jsonResponse({ ok: true, skipped: true });
+			}
 
-	const chatId = message.chat?.id;
-	const userId = String(message.from?.id || chatId || 'unknown');
-	const text = message.text;
+			// 可选：限制用户
+			if (env.ALLOWED_USER_IDS && env.ALLOWED_USER_IDS.trim()) {
+				const allowed = env.ALLOWED_USER_IDS.split(',')
+					.map((x) => x.trim())
+					.filter(Boolean);
 
-	if (!chatId || !text) {
-		return;
-	}
+				if (!allowed.includes(userId)) {
+					await sendTelegramMessage(env, chatId, '你没有权限使用此机器人。');
+					return jsonResponse({ ok: true });
+				}
+			}
 
-	// 可选：限制用户
-	if (env.ALLOWED_USER_IDS && env.ALLOWED_USER_IDS.trim()) {
-		const allowed = env.ALLOWED_USER_IDS.split(',')
-			.map((x) => x.trim())
-			.filter(Boolean);
-
-		if (!allowed.includes(userId)) {
-			await sendTelegramMessage(env, chatId, '你没有权限使用此机器人。');
-			return;
-		}
-	}
-
-	// /start
-	if (text.startsWith('/start')) {
-		await sendTelegramMessage(
-			env,
-			chatId,
-			`你好，我是 Dify 驱动的新闻助手。
+			// /start 这种轻任务可以直接处理，不进队列
+			if (text.startsWith('/start')) {
+				await sendTelegramMessage(
+					env,
+					chatId,
+					`你好，我是 Dify 驱动的新闻助手。
 
  你可以直接问我：
 
@@ -89,31 +77,121 @@ async function handleTelegramUpdate(update, env) {
 
  命令：
  /reset 重置当前对话`,
-		);
-		return;
+				);
+
+				return jsonResponse({ ok: true });
+			}
+
+			// /reset 也可以直接处理
+			if (text.startsWith('/reset')) {
+				await deleteConversationId(env, userId);
+				await sendTelegramMessage(env, chatId, '已重置当前对话。');
+				return jsonResponse({ ok: true });
+			}
+
+			// 防止 Telegram 重试导致同一 update 重复入队
+			if (updateId !== undefined && env.DIFY_CONVERSATIONS) {
+				const updateKey = `telegram:update:${updateId}`;
+				const exists = await env.DIFY_CONVERSATIONS.get(updateKey);
+
+				if (exists) {
+					return jsonResponse({
+						ok: true,
+						duplicated: true,
+						updateId,
+					});
+				}
+
+				await env.DIFY_CONVERSATIONS.put(updateKey, '1', {
+					expirationTtl: 60 * 60,
+				});
+			}
+
+			// 如果没有绑定 Queue，返回明确错误
+			if (!env.TELEGRAM_QUEUE) {
+				await sendTelegramMessage(env, chatId, '服务未配置队列 TELEGRAM_QUEUE，无法处理长任务。');
+
+				return jsonResponse(
+					{
+						ok: false,
+						error: 'TELEGRAM_QUEUE binding is missing',
+					},
+					500,
+				);
+			}
+
+			// 把耗时任务放入 Cloudflare Queue
+			await env.TELEGRAM_QUEUE.send({
+				updateId,
+				chatId,
+				userId,
+				text,
+				createdAt: Date.now(),
+			});
+
+			// 立即回复一个提示
+			await sendTelegramMessage(env, chatId, '已收到，正在检索和总结，请稍等...');
+
+			// 立即返回 Telegram，避免 Webhook 超时
+			return jsonResponse({
+				ok: true,
+				queued: true,
+			});
+		} catch (error) {
+			return jsonResponse(
+				{
+					ok: false,
+					error: String(error),
+				},
+				500,
+			);
+		}
+	},
+
+	async queue(batch, env, ctx) {
+		for (const message of batch.messages) {
+			const task = message.body;
+
+			try {
+				await handleQueuedTelegramTask(task, env);
+
+				// 成功后确认消息
+				message.ack();
+			} catch (error) {
+				console.error('Queue task failed:', error);
+
+				// 尝试通知 Telegram 用户
+				try {
+					if (task?.chatId) {
+						await sendTelegramMessage(env, task.chatId, `处理失败：${String(error)}`);
+					}
+				} catch (notifyError) {
+					console.error('Failed to notify Telegram:', notifyError);
+				}
+
+				// 如果你想让失败任务自动重试，可以改成 message.retry()
+				// 这里为了避免反复失败刷屏，默认 ack 掉
+				message.ack();
+			}
+		}
+	},
+};
+
+async function handleQueuedTelegramTask(task, env) {
+	const { chatId, userId, text } = task;
+
+	if (!chatId || !userId || !text) {
+		throw new Error('Invalid queue task payload');
 	}
 
-	// /reset 清除 Dify conversation_id
-	if (text.startsWith('/reset')) {
-		await deleteConversationId(env, userId);
-		await sendTelegramMessage(env, chatId, '已重置当前对话。');
-		return;
-	}
+	const difyResult = await callDify(env, {
+		query: text,
+		userId,
+	});
 
-	try {
-		await sendTelegramMessage(env, chatId, '正在检索和总结，请稍等...');
+	const answer = difyResult.answer || 'Dify 没有返回内容。';
 
-		const difyResult = await callDify(env, {
-			query: text,
-			userId,
-		});
-
-		const answer = difyResult.answer || 'Dify 没有返回内容。';
-
-		await sendTelegramMessage(env, chatId, answer);
-	} catch (error) {
-		await sendTelegramMessage(env, chatId, `处理失败：${String(error)}`);
-	}
+	await sendTelegramMessage(env, chatId, answer);
 }
 
 async function callDify(env, { query, userId }) {
@@ -143,6 +221,7 @@ async function callDify(env, { query, userId }) {
 	}
 
 	let data;
+
 	try {
 		data = JSON.parse(text);
 	} catch (e) {
@@ -158,6 +237,11 @@ async function callDify(env, { query, userId }) {
 
 async function sendTelegramMessage(env, chatId, text) {
 	const token = env.TELEGRAM_BOT_TOKEN;
+
+	if (!token) {
+		throw new Error('Missing TELEGRAM_BOT_TOKEN');
+	}
+
 	const url = `https://api.telegram.org/bot${token}/sendMessage`;
 
 	const chunks = splitText(text || '', 3500);
@@ -211,7 +295,7 @@ async function saveConversationId(env, userId, conversationId) {
 
 	const key = `dify:conversation:${userId}`;
 
-	// 7 天过期，可按需调整
+	// 7 天过期
 	await env.DIFY_CONVERSATIONS.put(key, conversationId, {
 		expirationTtl: 60 * 60 * 24 * 7,
 	});
