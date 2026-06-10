@@ -13,7 +13,16 @@
 	"upload_source_maps": true,
 	"compatibility_flags": [
 		"nodejs_compat"
-	]
+	],
+	"vars": {
+		"DIFY_API_URL": "https://api.dify.ai/v1/chat-messages"
+	},
+ "kv_namespaces": [
+    {
+      "binding": "DIFY_CONVERSATIONS",
+      "id": "a86b8ca26b8745d49c8b8184dc8663c0"
+    }
+  ]
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
